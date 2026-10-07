@@ -1,6 +1,10 @@
 import { classifyAnthropic429 } from "../../oauth/anthropic-rate-limit-policy";
 import { rotateAnthropicAccountOnResponse } from "../../oauth/anthropic-account-refusal";
+import { authorizeResendForRecovery } from "../../lib/request-resend-gate";
+import { ambiguousResendAllowanceFor, selfContainedResponsesBody } from "./reset-replay";
+import { transientSendCapFor } from "./request-send-budget";
 import { isNonReplayableResponse } from "../../lib/upstream-retry";
+import { sanitizeNonReplayableUpstreamError } from "./non-replayable-error";
 import { isLocalUpstream } from "../../lib/local-upstream";
 import type { ResponsesRequestContext, ResponsesAdmissionState } from "./core-options";
 import type { PreparedResponsesRequest } from "./request-prepare";
@@ -25,6 +29,7 @@ import { withProviderRequestSlot } from "../../providers/request-pacing";
 import { providerFetch, fetchWithHeaderTimeout, safeHostLabel } from "./fetch-helpers";
 import {
   transientRetryPolicyFor,
+  resetReplayPolicyFor,
   rateLimitRetryPolicyFor,
   hasKeyPoolFailover,
   rotateProviderTransportOn401,
@@ -96,6 +101,9 @@ import {
 } from "../../lib/errors";
 import { resolveClientRetryAfter } from "../../lib/retry-after";
 import { cancelBodyOnAbort } from "../../lib/abort";
+import { createCodexAuthDispatchGuard, releaseCodexAuthContextProbeLease, unwrapUpstreamRetryEvidenceError } from "../../codex/auth-context";
+import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
+import { mapCodexAuthContextErrorToResponse } from "./codex-auth-error";
 import { chargeWorkflowSends } from "../../lib/workflow-budget";
 import { isAntigravityValidationRefusal } from "./antigravity-validation-refusal";
 
@@ -156,6 +164,8 @@ export async function prepareAdapterExchange(
     | "reserveCredentialHop"
     | "pendingHopPermit"
     | "workflowRootId"
+    | "claimAmbiguousResend"
+    | "sendsUsed"
   >,
 ) {
   const { options, config, logCtx, req } = requestContext;
@@ -189,8 +199,17 @@ export async function prepareAdapterExchange(
     recoveryClassFor,
     sendBudgetExhausted,
     reserveCredentialHop,
+    claimAmbiguousResend,
   } = sendBudgetState;
 
+
+  let selfContainedJudgment: boolean | undefined;
+  const requestIsSelfContained = (): boolean =>
+    selfContainedJudgment ??= selfContainedResponsesBody(parsed._rawBody);
+  const claimPreHeaderResend = (): boolean => authorizeResendForRecovery(
+    "pre-header", "connection-reset",
+    ambiguousResendAllowanceFor(route.provider, requestIsSelfContained, claimAmbiguousResend),
+  ).allowed;
 
   const upstream = new AbortController();
   const cleanupUpstreamAbort = linkAbortSignal(upstream, options.abortSignal);
@@ -329,6 +348,8 @@ export async function prepareAdapterExchange(
             dispatchOverride: oauthDispatch(builtInitialRequest),
             providerName: route.providerName,
             modelId: route.modelId,
+            beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
+              ? createCodexAuthDispatchGuard(admissionState.authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
           }),
         }));
     } else {
@@ -343,6 +364,13 @@ export async function prepareAdapterExchange(
       const compactPrepaid = options.compactionRecoveryAttempted ? sendBudgetState.pendingHopPermit : undefined;
       if (compactPrepaid) sendBudgetState.pendingHopPermit = undefined;
       let compactPrepaidUsed = false;
+      // Combo and emergency compaction admission already book this target's first send.
+      // Its configured initial ceiling is target-local; the shared remainder below still
+      // accounts for earlier targets without deducting their sends from this target twice.
+      const initialSendCap = transientPolicy || resetReplayPolicyFor(route.provider)
+        ? transientSendCapFor(transientPolicy?.attempts,
+          (options.comboAttempt || compactPrepaid) ? 0 : sendBudgetState.sendsUsed)
+        : 1;
       const fetchWithRetryPolicy = (route.provider.adapter === "google" || transientPolicy)
         ? fetchWithTransientRetry
         : fetchWithResetRetry;
@@ -362,20 +390,19 @@ export async function prepareAdapterExchange(
               dispatchOverride: oauthDispatch(builtInitialRequest),
               providerName: route.providerName,
               modelId: route.modelId,
+              beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
+                ? createCodexAuthDispatchGuard(admissionState.authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
             }));
         },
         {
           abortSignal: upstream.signal,
           label: safeHostLabel(builtInitialRequest.url),
-          ...(transientPolicy || compactPrepaid
-            // Draws the remainder, not the raw policy. A combo child inherits the parent's
-            // holder but used to take a fresh full allowance on its own first send, so the
-            // shared counter was inherited without ever being read as a limit.
+          claimAmbiguousResend: claimPreHeaderResend,
+          ...(transientPolicy || resetReplayPolicyFor(route.provider) || compactPrepaid
             ? {
-              // The first emergency send is already paid for. Only retries consume the
-              // remaining allowance; treating the booking as unavailable blocks a cap of two.
-              attempts: Math.min(transientPolicy?.attempts ?? 1,
-                remainingTransientSendBudget(transientPolicy?.attempts ?? 1) + (compactPrepaid ? 1 : 0)),
+              // A pending compaction permit already booked this leg's first physical send.
+              attempts: Math.min(initialSendCap,
+                remainingTransientSendBudget(initialSendCap) + (compactPrepaid ? 1 : 0)),
               onSendsConsumed: noteTransientSends,
             }
             : {}),
@@ -387,6 +414,13 @@ export async function prepareAdapterExchange(
     upstream.abort();
     if (options.abortSignal?.aborted) return clientCancelledResponse();
     const refusal = err instanceof UpstreamRetryEvidenceError ? err.cause : err;
+    const codexRefusal = mapCodexAuthContextErrorToResponse(unwrapUpstreamRetryEvidenceError(err), {
+      now: Date.now(), accountSelector: route.codexAccountNamespace,
+    });
+    if (codexRefusal) {
+      releaseCodexAuthContextProbeLease(admissionState.authCtx);
+      return codexRefusal;
+    }
     // A pause committed during pacing is local admission policy, not a failed upstream.
     if (refusal instanceof OAuthAccountPausedError) {
       return formatErrorResponse(403, "permission_error", publicOAuthAuthenticationErrorMessage(refusal));
@@ -531,6 +565,8 @@ export async function prepareAdapterExchange(
                   dispatchOverride: oauthDispatch(retryRequest),
                   providerName: route.providerName,
                   modelId: route.modelId,
+                  beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
+                    ? createCodexAuthDispatchGuard(admissionState.authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
                 }),
               });
             });
@@ -545,14 +581,21 @@ export async function prepareAdapterExchange(
           const refetchWithPolicy = (route.provider.adapter === "google" || refetchTransientPolicy)
             ? fetchWithTransientRetry
             : fetchWithResetRetry;
-          // Same rule as the passthrough rebuild: spend the base allowance first, then the one
-          // shared final-recovery reserve, so a recovery that follows a spent streak still gets
-          // its single send instead of dying at three.
-          const refetchAllowance = refetchTransientPolicy
-            ? recoverySendAllowance(
-              refetchTransientPolicy.attempts,
-              recoveryClassFor(recovery),
+          const helperCountsSends = refetchTransientPolicy !== null || resetReplayPolicyFor(route.provider) !== null;
+          const prepaid = sendBudgetState.pendingHopPermit;
+          const configuredTotal = refetchTransientPolicy?.attempts;
+          const refetchCap = transientSendCapFor(configuredTotal,
+            sendBudgetState.sendsUsed - (prepaid ? 1 : 0));
+          // An exact total includes a booked hop, even when it consumed the last base slot.
+          // Keep that funded send while forbidding the final reserve from widening the total.
+          const prepaidLastSlot = helperCountsSends && configuredTotal !== undefined && prepaid
+            && refetchCap > 0 && remainingTransientSendBudget(refetchCap) === 0;
+          if (prepaidLastSlot) sendBudgetState.pendingHopPermit = undefined;
+          const refetchAllowance = helperCountsSends
+            ? prepaidLastSlot ? { attempts: 1, permit: prepaid } : recoverySendAllowance(
+              refetchCap, recoveryClassFor(recovery),
               `${route.providerName}|${route.modelId}|${recovery}`,
+              { allowFinalRecoveryReserve: configuredTotal === undefined },
             )
             : undefined;
           try {
@@ -566,7 +609,7 @@ export async function prepareAdapterExchange(
                 // can be refused above before it does. use() past the first attempt is a no-op.
                 onDispatch?.();
                 if (preserveFailureResponse) replacementAdmitted = true;
-                if (!refetchTransientPolicy) chargeFastDowngradeWorkflowSend();
+                if (!refetchAllowance) chargeFastDowngradeWorkflowSend();
                 return fetchWithHeaderTimeout(retryRequest.url,
                   applyUpstreamRecoveryInit({
                     method: retryRequest.method, headers: retryRequest.headers, body: retryRequest.body,
@@ -575,11 +618,14 @@ export async function prepareAdapterExchange(
                     dispatchOverride: oauthDispatch(retryRequest),
                     providerName: route.providerName,
                     modelId: route.modelId,
+                    beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
+                      ? createCodexAuthDispatchGuard(admissionState.authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
                   }));
               },
               {
                 abortSignal: upstream.signal,
                 label: safeHostLabel(retryRequest.url),
+                claimAmbiguousResend: claimPreHeaderResend,
                 ...(refetchAllowance
                   ? {
                     attempts: refetchAllowance.attempts,
@@ -597,6 +643,15 @@ export async function prepareAdapterExchange(
           retryRequest.releaseBodyObservation?.();
         }
       } catch (err) {
+        const codexRefusal = !options.abortSignal?.aborted && mapCodexAuthContextErrorToResponse(unwrapUpstreamRetryEvidenceError(err), {
+          now: Date.now(), accountSelector: route.codexAccountNamespace,
+        });
+        if (codexRefusal) {
+          cleanupUpstreamAbort();
+          upstream.abort();
+          releaseCodexAuthContextProbeLease(admissionState.authCtx);
+          return { failed: codexRefusal };
+        }
         if (preserveFailureResponse && !replacementAdmitted && !options.abortSignal?.aborted)
           return { failed: preserveFailureResponse };
         cleanupUpstreamAbort();
@@ -638,7 +693,7 @@ export async function prepareAdapterExchange(
       const adapterOwnsDispatch = transportState.activeAdapter.fetchResponse !== undefined;
       const hop = reserveCredentialHop("auth-recovery",
         `${route.providerName}|${route.modelId}|antigravity-auth`,
-        !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null);
+        !adapterOwnsDispatch && (transientRetryPolicyFor(route.provider) !== null || resetReplayPolicyFor(route.provider) !== null));
       if (!hop.allowed) return null;
       try {
         const snapshot = await failoverAccountSnapshot(route.providerName, nextId);
@@ -677,8 +732,9 @@ export async function prepareAdapterExchange(
       // Preserve the terminal verdict through adapter and combo error formatting.
       // This also covers a reset reached by a 401/429/413 recovery refetch.
       if (isNonReplayableResponse(upstreamResponse)) {
-        cleanupUpstreamAbort();
-        return upstreamResponse;
+        try {
+          return await sanitizeNonReplayableUpstreamError(upstreamResponse, upstream.signal);
+        } finally { cleanupUpstreamAbort(); }
       }
      if (
        upstreamResponse.status === 401
@@ -708,7 +764,7 @@ export async function prepareAdapterExchange(
               const adapterOwnsDispatch = transportState.activeAdapter.fetchResponse !== undefined;
               const hop = reserveCredentialHop("auth-recovery",
                 `${route.providerName}|${route.modelId}|terminal-refresh-account`,
-                !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null);
+                !adapterOwnsDispatch && (transientRetryPolicyFor(route.provider) !== null || resetReplayPolicyFor(route.provider) !== null));
               if (hop.allowed) {
                 try {
                   const admitted = await applyFailoverSnapshot(alternate);
@@ -861,7 +917,7 @@ export async function prepareAdapterExchange(
         const hop = reserveCredentialHop(
           "repair",
           `${route.providerName}|${route.modelId}|anthropic-fast-downgrade`,
-          !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
+          !adapterOwnsDispatch && (transientRetryPolicyFor(route.provider) !== null || resetReplayPolicyFor(route.provider) !== null),
         );
         if (hop.allowed) {
           anthropicFastDowngradeGuard.attempted = true;
@@ -1059,10 +1115,9 @@ export async function prepareAdapterExchange(
         const hop = reserveCredentialHop(
           "auth-recovery",
           `${route.providerName}|${route.modelId}|adapter-recovery-oauth-429`,
-          // Only a helper-routed replay reports this send back. A reset-only refetch reports
-          // nothing and an adapter ladder settles the booking itself, so promising an external
-          // report on either would leave a booking pending until it swallowed a later charge.
-          !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
+          // Transient and opted-in reset helpers report physical sends; an adapter-owned
+          // ladder settles its own booking.
+          !adapterOwnsDispatch && (transientRetryPolicyFor(route.provider) !== null || resetReplayPolicyFor(route.provider) !== null),
         );
         if (!hop.allowed) break;
         const nextAccountId = rotateGenericOAuthAccountOnRefusal(
@@ -1164,10 +1219,9 @@ export async function prepareAdapterExchange(
         const hop = reserveCredentialHop(
           "auth-recovery",
           `${route.providerName}|${route.modelId}|adapter-recovery-oauth-429`,
-          // Only a helper-routed replay reports this send back. A reset-only refetch reports
-          // nothing and an adapter ladder settles the booking itself, so promising an external
-          // report on either would leave a booking pending until it swallowed a later charge.
-          !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
+          // Transient and opted-in reset helpers report physical sends; an adapter-owned
+          // ladder settles its own booking.
+          !adapterOwnsDispatch && (transientRetryPolicyFor(route.provider) !== null || resetReplayPolicyFor(route.provider) !== null),
         );
         if (!hop.allowed) break;
         const nextAccountId = rotateGenericOAuthAccountOn429(
@@ -1276,7 +1330,7 @@ export async function prepareAdapterExchange(
         const hop = reserveCredentialHop(
           "auth-recovery",
           `${route.providerName}|${route.modelId}|adapter-recovery-oauth-verify`,
-          !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
+          !adapterOwnsDispatch && (transientRetryPolicyFor(route.provider) !== null || resetReplayPolicyFor(route.provider) !== null),
         );
         if (!hop.allowed) break;
         // Auth-refusal rotation, not the rate-limit one: a verification refusal

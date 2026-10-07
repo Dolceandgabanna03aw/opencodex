@@ -11,7 +11,7 @@ When a successful streamed native response has a missing or unrecognized non-JSO
 
 ## Responses HTTP/SSE
 
-Optional Codex memory selection enters `src/server/responses/request-prepare.ts` for HTTP and WebSocket frames, as specified in [memory phase routing](responses-failover.md#memory-phase-routing); an unset phase keeps its existing route and starts no background work. Responses request preparation stabilizes incoming `<skills_instructions>` under `skills.catalog_refresh`: `per_session` (default) reuses the first received catalog for a conversation; `per_turn` leaves the supplied catalog unchanged. Other instruction sections and user/tool content remain untouched. Requests without a reliable conversation identity bypass snapshots; shared prompt-cache cohorts are not conversation identities. Only a body with exactly one catalog block across its instructions and developer/system content takes part; two or more pass through unchanged. A known snapshot is substituted before parsing, but a new catalog is stored only when preparation reaches its success return, so a request rejected by parsing or admission pins nothing. Without a named principal, snapshots are shared by conversation id only on a server that requires no data-plane auth. Snapshots are process-local, expire after four idle hours, and use bounded LRU retention; oversized blocks bypass caching. The dashboard's `src/codex/prompt-layers.ts` and `src/codex/prompt-text-probe.ts` continue observing current files for previews and do not own session snapshots.
+HTTP ingress applies the [caller header contract](../data-planes/inbound-compat.md#http-caller-conversation-identity) before admission and dispatch. Optional Codex memory selection enters `src/server/responses/request-prepare.ts` for HTTP and WebSocket frames, as specified in [memory phase routing](responses-failover.md#memory-phase-routing); an unset phase keeps its existing route and starts no background work. Responses request preparation stabilizes incoming `<skills_instructions>` under `skills.catalog_refresh`: `per_session` (default) reuses the first received catalog for a conversation; `per_turn` leaves the supplied catalog unchanged. Other instruction sections and user/tool content remain untouched. Requests without a reliable conversation identity bypass snapshots; shared prompt-cache cohorts are not conversation identities. Only a body with exactly one catalog block across its instructions and developer/system content takes part; two or more pass through unchanged. A known snapshot is substituted before parsing, but a new catalog is stored only when preparation reaches its success return, so a request rejected by parsing or admission pins nothing. Without a named principal, snapshots are shared by conversation id only on a server that requires no data-plane auth. Snapshots are process-local, expire after four idle hours, and use bounded LRU retention; oversized blocks bypass caching. The dashboard's `src/codex/prompt-layers.ts` and `src/codex/prompt-text-probe.ts` continue observing current files for previews and do not own session snapshots.
 `/v1/responses` is the main Codex-facing endpoint. The server parses Responses input, routes to a
 provider, lets the selected adapter speak the upstream protocol, then bridges adapter events back to
 Responses-compatible streaming output. The routed provider name follows every adapter build, including retries and continuations; only `github-copilot` injects a configured `modelContextTiers` value as upstream `contextTier`, while unconfigured passthrough retains the caller field. For an opted-in key-auth provider, a hosted-search continuation stays bound to the API-key selection that served the first leg; the contract is the [hosted-search continuation binding](../providers-and-adapters.md#hosted-search-continuation-binding).
@@ -231,7 +231,7 @@ post-namespace request fail with HTTP 400.
 The option-aware `openai` provider uses `openai-responses` with `authMode: "forward"`. Pool mode
 resolves main plus added accounts through affinity/quota/cooldown ownership; Direct forwards only
 the allowed Codex/OpenAI auth/session headers from the current request and short-circuits pool
-state. `openai-apikey` uses its configured key and canonical API base URL. Missing credentials fail
+state. Stored Pool credentials follow the [credit policy](../codex-account-controls.md#stored-account-authentication-policy) through refresh copies and physical HTTP/WebSocket dispatch; a policy refusal before transport contact announces no replay send. `openai-apikey` uses its configured key and canonical API base URL. Missing credentials fail
 within their route; neither route falls through to the other. See
 [`openai-tiers.md`](../providers/openai-tiers.md).
 
@@ -420,11 +420,11 @@ is composed from the following owners in `src/server/responses/`; none is a gene
 | `request-sidecar-auth.ts` | Routed-compaction image projection, sidecar credential resolution and vision preprocessing. |
 | `response-effects.ts` | Completion notification, replay publication and live request-tool aliases. |
 | `request-send-budget.ts` | Request-wide send accounting, remaining allowance, the pending recovery permit and the shared ambiguous-resend grant. |
-| `reset-replay.ts` | The operator opt-in for replacing an ambiguous native Responses send, and the per-request grant both stages claim from. |
+| `reset-replay.ts` | Self-contained-request eligibility and the shared operator replacement grant for native Responses and generic translated initial/rebuilt pre-header sends; adapter-owned transports and translated post-header failures are excluded. |
 | `request-spend.ts` | This request's entries in the durable spend ledger: one per physical send, settled from the terminal usage. |
 | `passthrough-execution.ts` | Native host-lease transfer and the enclosing dispatch/delivery `finally`. |
 | `passthrough-dispatch.ts` | Native request preparation, upstream sends and pre-commit recovery. |
-| `passthrough-delivery.ts`, `terminal-error-redaction.ts` | Native HTTP/SSE/JSON delivery, rewrite/inspection, terminal accounting, terminal diagnostic redaction before client delivery, and xAI tool-envelope filtering before continuation storage. |
+| `passthrough-delivery.ts`, `terminal-error-redaction.ts`, `non-replayable-error.ts` | Native HTTP/SSE/JSON delivery and terminal accounting. Marked real errors use bounded reads to retain only allowlisted error type and code, keep status and non-replayability plus `x-should-retry: false` when present, and withhold upstream body text and all other upstream headers; the client receives a fixed generic message and synthetic refusals stay distinct. SSE diagnostics and xAI tool-envelope filtering precede client delivery/continuation storage. |
 | `policy-refusal.ts` | Rewrites an allowlisted non-combo HTTP 403 model refusal (`isUpstreamPolicyRefusal` in `src/lib/errors.ts`) from an xAI destination only (`isXaiResponsesDestination`: api.x.ai or the Grok CLI proxy, on either wire) to an HTTP 200 Responses `incomplete` / `content_filter` payload, JSON or SSE, for both `adapter-dispatch.ts` and `passthrough-delivery.ts`. A streamed rewrite takes the turn admission lease and releases it when the body finishes, so the refusal stays inside active-turn accounting. Combo attempts keep the original 403 so failover classifies it as a hop. |
 | `sidecar-execution.ts` | Image/video versus web-search execution and their shared rotation hook. |
 | `completion-policy.ts`, `run-turn-execution.ts` | Empty-completion eligibility and adapter-owned event turns. |
@@ -432,7 +432,7 @@ is composed from the following owners in `src/server/responses/`; none is a gene
 | `adapter-continuation.ts`, `adapter-delivery.ts` | Continuation event sources and final streaming/buffered bridging; a streamed turn with a `clientEncoder` option is handed to `src/server/inference/client-encoder-delivery.ts` instead of the bridge. |
 
 Reusable helpers live in `core-auth.ts`, `core-codex-account.ts`, `core-combo.ts`,
-`core-combo-failure.ts`, `core-combo-native.ts`, `core-errors.ts`, `core-lifetime.ts`, `core-normalize.ts`,
+`core-combo-failure.ts`, `core-combo-native.ts`, `combo-requested-effort.ts`, `core-errors.ts`, `core-lifetime.ts`, `core-normalize.ts`,
 `core-opaque-recovery.ts` and `core-replay.ts`. `core-options.ts` owns the public option types
 and small composition contracts, including [finite model-refusal evidence](../providers-and-adapters.md#combo-model-refusal-evidence). Existing public helper names are re-exported by `core.ts`.
 Adapter construction remains with the existing registry; `fetch-helpers.ts` remains a leaf. For Kiro OAuth with load settings, `request-transport.ts` acquires a lease on the admitted account and transfers it before a reactive replacement send; cancellation permanently fences the request holder so recovery cannot install a late lease after abort cleanup. `core.ts` and `core-lifetime.ts` release the lease on returned-body completion, error, or cancellation, outside the inner admission `finally`.
@@ -541,9 +541,9 @@ not `openai-chat` is decided without a copy. An eligible child is dispatched thr
 already opened (its opening stays hand-rolled: the ordinal comes from the parent context while the
 active attempt and requested effort land on the child context, which `beginInferenceAttempt`
 does not express). The child gets the combo's per-target send budget, the client's abort signal
-and the turn lease, and the combo's reasoning-effort policy mapped onto `reasoning_effort`
-through `concreteComboRequestBody`, so the two lanes cannot disagree on effort. It records its
-attempt path as native (`[chat, chat]`) and its answer is marked `chat`.
+and the turn lease, and the configured combo effort policy mapped onto `reasoning_effort` through `concreteComboRequestBody`.
+The initial JEV override changes only the separate Responses body; native labels omit it and keep native child transitions
+([JEV Decision Routing](../providers/jev-decision.md)). Its attempt path is native (`[chat, chat]`) and its answer is marked `chat`.
 
 Send accounting: the combo's hop reservation already booked the target's first send, so the native
 child opens no spend tracker; it reports each physical send to the target budget (the first

@@ -52,10 +52,14 @@ describe("leading-system chat templates (Qwen3.8-27B, OrcaSAQ-2-Cyber-27B)", () 
     // Internal Eliza serves the same pinned template under dashed checkpoint ids.
     "qwen3-8-27b-fp8",
     "qwen3-8-27b-lora",
-    // OrcaSAQ-2-Cyber-27B's GGUF pins the same contract: late system raises, developer
-    // unsupported. Org prefix and quant tag are both optional on the wire id.
+    // Gateways prefix the served id with their own namespace (LiteLLM, #6674).
+    "openai/Qwen3.8-27B",
+    "hosted_vllm/Qwen/Qwen3.8-27B",
+    // Orca GGUF ids can carry namespaces and an optional quant tag.
     "orcarouter/OrcaSAQ-2-Cyber-27B-Uncensored-GGUF:UNKNOWN",
     "OrcaSAQ-2-Cyber-27B-Uncensored-GGUF:Q8_0",
+    "OrcaSAQ-2-Cyber-27B-GGUF",
+    "hosted_vllm/orcarouter/OrcaSAQ-2-Cyber-27B-Uncensored-GGUF:Q8_0",
   ])("keeps a late reminder after the first user without an invalid system role: %s", modelId => {
     const messages = serialize(modelId);
     expect(messages).toEqual([
@@ -67,10 +71,23 @@ describe("leading-system chat templates (Qwen3.8-27B, OrcaSAQ-2-Cyber-27B)", () 
     expect(() => assertTemplateAccepts(messages)).not.toThrow();
   });
 
-  test("does not send a developer role even if a gateway declaration says it accepts one", () => {
-    const messages = serialize("Qwen3.8-27B", { ...provider, foldDeveloperRoleToSystem: false });
-    expect(messages[2]).toEqual({ role: "user", content: "Answer in one sentence." });
-    expect(() => assertTemplateAccepts(messages)).not.toThrow();
+  test.each(["Qwen3.8-27B", "OrcaSAQ-2-Cyber-27B-Uncensored-GGUF:Q8_0"])(
+    "does not send a developer role even if a gateway declaration says it accepts one: %s", modelId => {
+      const messages = serialize(modelId, { ...provider, foldDeveloperRoleToSystem: false });
+      expect(messages[2]).toEqual({ role: "user", content: "Answer in one sentence." });
+      expect(() => assertTemplateAccepts(messages)).not.toThrow();
+    },
+  );
+
+  test.each([
+    "OrcaSAQ-2-Cyber-27B",
+    "orcarouter/OrcaSAQ-2-Cyber-27B-Uncensored",
+    "OrcaSAQ-2-Cyber-27B-Uncensored:Q8_0",
+    "OrcaSAQ-2-Cyber-27B-Uncensored:GGUF",
+  ])("non-GGUF Orca ids keep their configured developer role: %s", modelId => {
+    expect(serialize(modelId)[2]).toEqual({ role: "system", content: "Answer in one sentence." });
+    expect(serialize(modelId, { ...provider, foldDeveloperRoleToSystem: false })[2])
+      .toEqual({ role: "developer", content: "Answer in one sentence." });
   });
 
   test("other models keep their recorded role and chronological position", () => {
@@ -78,6 +95,10 @@ describe("leading-system chat templates (Qwen3.8-27B, OrcaSAQ-2-Cyber-27B)", () 
     expect(serialize("other-model", { ...provider, foldDeveloperRoleToSystem: false })[2])
       .toEqual({ role: "developer", content: "Answer in one sentence." });
     expect(serialize("Qwen3.8-27B-FP8")[2]).toEqual({ role: "system", content: "Answer in one sentence." });
+    expect(serialize("openai/Qwen3.8-27B-FP8")[2]).toEqual({ role: "system", content: "Answer in one sentence." });
+    expect(serialize("openai/Qwen3.8-27B-Instruct")[2]).toEqual({ role: "system", content: "Answer in one sentence." });
+    expect(serialize("openai/Qwen3.8-27B", { ...provider, baseUrl: "https://api.openai.com/v1" })[2])
+      .toEqual({ role: "system", content: "Answer in one sentence." });
     expect(serialize("Qwen3.8-27B", { ...provider, baseUrl: "https://api.openai.com/v1" })[2])
       .toEqual({ role: "system", content: "Answer in one sentence." });
   });

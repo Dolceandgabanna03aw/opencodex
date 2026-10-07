@@ -28,7 +28,7 @@ Shared parsing and streaming follow the [request-copy](../transports/byte-accoun
 
 Human-readable connect and sync-refresh diagnostics follow the [terminal rendering contract](../runtime.md#cli-readiness-diagnostics), with regression coverage for both paths in `tests/cli/cli-connect-readiness.test.ts`.
 
-`tests/cli/cli-config-show-client.test.ts` covers the separate read-only config annotation path:
+`tests/cli/cli-config-default-show.test.ts` covers optional-show parsing, offline display and explicit-action preservation; `tests/cli/cli-config-show-client.test.ts` covers the separate read-only config annotation path:
 `src/cli/config-command.ts` derives token ownership without importing the connect command or
 triggering catalog, lifecycle, or ACL-hardening work.
 
@@ -40,7 +40,7 @@ The Codex restart command follows the [CLI restart scope contract](../runtime.md
 
 The account reference documents the [Orca source-owned import](../codex-home.md#orca-source-owned-account-import).
 Its local-only command is declared in `src/cli/capabilities.ts`, and the generated skill surface
-lists its required source/registry paths and preview/apply flags.
+lists its required source/registry paths and preview/apply flags. The index and domain chapters follow the [CLI reference generation contract](../cli-management.md#generated-operating-reference).
 
 Local validation follows [the contributor test policy](../../AGENTS.md#commands): run the
 suite by default, with a documented resource exception requiring focused regression tests.
@@ -235,7 +235,7 @@ it is promoted, so those files follow the promotion model rather than ordinary i
 
 `scripts/test.ts` owns `SERIAL_FULL_SUITE_FILES`, the shared process-isolation roster. Local
 full-suite runs, both macOS paths, and `scripts/ci/run-bun-test-batches.sh` execute those files
-alone with fresh process homes. Hosted batches assign shard membership by the per-file durations
+alone with fresh process homes, including launchd repair and standalone home/lease cases. Hosted batches assign shard membership by the per-file durations
 in `scripts/ci/test-durations.tsv` (sorted round-robin when nothing is recorded), run each shard's
 files in sorted order and split only process boundaries; every selected file still runs once.
 Ordinary macOS shards select 1/2 and 2/2 from the full file list; macOS control selects 1/1. Both
@@ -366,7 +366,7 @@ observed at startup. Replacing that manifest under a live process fences `/healt
 stability timer; if the same new manifest identity remains readable and distinct, the timer enters the existing
 drain-and-restart handoff without waiting for another request. A temporarily unreadable manifest
 is polled until readable and then receives a fresh full stability interval, while a return to the
-startup identity cancels the pending restart. Failed restart admission retries after the same
+startup identity cancels the pending restart. The replacement spawns `process.execPath`, which an in-place npm install leaves as the `bun` package's small placeholder until its postinstall runs, so while that path fails the `REAL_BUN_MIN_BYTES` gate the restart waits the same way and then debounces afresh; meanwhile `installedVersion` stays unreported, so a manual restart is refused as unsettled. Failed restart admission retries after the same
 bounded delay. Stopping the server before the accepted restart begins vetoes it, and a service child
 restarts only while it still owns the service home. Source checkouts and standalone binaries remain outside this fence.
 

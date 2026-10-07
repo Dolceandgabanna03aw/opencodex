@@ -418,6 +418,17 @@
       ]
     },
     {
+      "path": "cli-management.md",
+      "tier": 5,
+      "title": "CLI management and discovery",
+      "scope": "Terminal help and capability metadata, management-client output and the generated operating reference.",
+      "documents": [
+        "src/cli/",
+        "scripts/generate-ocx-skill-surface.ts",
+        "skills/ocx/"
+      ]
+    },
+    {
       "path": "gui-and-management-api.md",
       "tier": 5,
       "title": "GUI And Management API",
@@ -553,9 +564,12 @@
       "path": "remote-link.md",
       "tier": 3,
       "title": "Remote Link",
-      "scope": "SSH machine-link building blocks: OpenSSH argument policy, ssh_config candidates, tunnel lifecycle reducer and the private link store.",
+      "scope": "SSH machine-link building blocks: OpenSSH argument policy, ssh_config candidates, tunnel lifecycle reducer, the private link store, and standalone pairing-grant delivery.",
       "documents": [
-        "src/link/"
+        "src/link/",
+        "src/lib/gui-pair-intent.ts",
+        "src/lib/windows-owner-acl.ts",
+        "src/server/gui-pair-delivery.ts"
       ]
     },
     {
