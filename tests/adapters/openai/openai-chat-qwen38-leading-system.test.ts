@@ -34,7 +34,7 @@ function serialize(modelId: string, target = provider): Array<{ role: string; co
   return (JSON.parse(request.body) as { messages: Array<{ role: string; content: string }> }).messages;
 }
 
-// Qwen's pinned Jinja template raises on a non-leading system or an unrecognized developer role.
+// Both pinned Jinja templates raise on a non-leading system or an unrecognized developer role.
 // A later user is rendered as its own turn. Keep this oracle separate from the adapter selector.
 function assertTemplateAccepts(messages: Array<{ role: string }>): void {
   messages.forEach((message, index) => {
@@ -45,13 +45,17 @@ function assertTemplateAccepts(messages: Array<{ role: string }>): void {
   });
 }
 
-describe("Qwen3.8-27B leading-system template", () => {
+describe("leading-system chat templates (Qwen3.8-27B, OrcaSAQ-2-Cyber-27B)", () => {
   test.each([
     "Qwen3.8-27B",
     "Qwen/Qwen3.8-27B",
     // Internal Eliza serves the same pinned template under dashed checkpoint ids.
     "qwen3-8-27b-fp8",
     "qwen3-8-27b-lora",
+    // OrcaSAQ-2-Cyber-27B's GGUF pins the same contract: late system raises, developer
+    // unsupported. Org prefix and quant tag are both optional on the wire id.
+    "orcarouter/OrcaSAQ-2-Cyber-27B-Uncensored-GGUF:UNKNOWN",
+    "OrcaSAQ-2-Cyber-27B-Uncensored-GGUF:Q8_0",
   ])("keeps a late reminder after the first user without an invalid system role: %s", modelId => {
     const messages = serialize(modelId);
     expect(messages).toEqual([
